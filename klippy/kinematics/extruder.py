@@ -74,6 +74,14 @@ class PrinterExtruder:
         gcode.register_mux_command("SET_EXTRUDER_STEP_DISTANCE", "EXTRUDER",
                                    self.name, self.cmd_SET_E_STEP_DISTANCE,
                                    desc=self.cmd_SET_E_STEP_DISTANCE_help)
+        self.autotemp_last_time = 0.
+        self.autotemp_multiplier = 0.
+        self.autotemp_max = 0.
+        self.autotemp_min = 0.
+        self.autotemp_last_autotemp = 0.
+        self.autotemp_weight_last = 0.9
+        self.autotemp_move_sum = 0.
+        self.autotemp_mes_time = 1.
     def update_move_time(self, flush_time):
         self.trapq_finalize_moves(self.trapq, flush_time)
     def _set_pressure_advance(self, pressure_advance, smooth_time):
@@ -148,18 +156,45 @@ class PrinterExtruder:
         pressure_advance = 0.
         if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
             pressure_advance = self.pressure_advance
+        self._autotemp(print_time,move)
         # Queue movement (x is extruder movement, y is pressure advance)
         self.trapq_append(self.trapq, print_time,
                           move.accel_t, move.cruise_t, move.decel_t,
                           move.start_pos[3], 0., 0.,
                           1., pressure_advance, 0.,
                           start_v, cruise_v, accel)
+    def _autotemp(self,print_time,move):
+        if not self.autotemp_multiplier:
+            return
+        self.autotemp_move_sum = self.autotemp_move_sum + move.axes_r[3] * move.axes_d[3]
+        if not self.autotemp_last_time:
+            self.autotemp_last_time = print_time
+            return
+        if print_time - self.autotemp_last_time < self.autotemp_mes_time:
+            return
+        if self.autotemp_last_autotemp == 0:
+            self.autotemp_last_autotemp = self.autotemp_min
+        velocity = self.autotemp_move_sum / ( print_time - self.autotemp_last_time )
+        autotemp = self.autotemp_min + velocity * self.autotemp_multiplier
+        if autotemp > self.autotemp_max:
+            autotemp = self.autotemp_max
+        if autotemp < self.autotemp_min:
+            autotemp = self.autotemp_min
+        autotemp_weighed = self.autotemp_last_autotemp*self.autotemp_weight_last + autotemp*(1-self.autotemp_weight_last)
+        pheaters = self.printer.lookup_object('heaters')
+        pheaters.set_temperature(self.get_heater(), autotemp_weighed, False)
+        self.autotemp_last_time = print_time
+        self.autotemp_move_sum = 0.
+        self.autotemp_last_autotemp = autotemp_weighed
     def find_past_position(self, print_time):
         return self.stepper.get_past_commanded_position(print_time)
     def cmd_M104(self, gcmd, wait=False):
         # Set Extruder Temperature
         temp = gcmd.get_float('S', 0.)
         index = gcmd.get_int('T', None, minval=0)
+        autotemp_multiplier = gcmd.get_float('F', 0., minval=0)
+        autotemp_weight_last = gcmd.get_float('W', 0.9, minval=0, maxval=1)
+        autotemp_max = gcmd.get_float('B', 0., minval=temp)
         if index is not None:
             section = 'extruder'
             if index:
@@ -171,6 +206,10 @@ class PrinterExtruder:
                 raise gcmd.error("Extruder not configured")
         else:
             extruder = self.printer.lookup_object('toolhead').get_extruder()
+        extruder.autotemp_multiplier = autotemp_multiplier
+        extruder.autotemp_max = autotemp_max
+        extruder.autotemp_min = temp
+        extruder.autotemp_weight_last = autotemp_weight_last
         pheaters = self.printer.lookup_object('heaters')
         pheaters.set_temperature(extruder.get_heater(), temp, wait)
     def cmd_M109(self, gcmd):
